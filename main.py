@@ -16,10 +16,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 TOKEN = "8478058553:AAGR0eMotTJy5_zM-65bHGGsm2ImcOKKfeE"
 ADMINS = {5815294733}  # <-- o'zingni Telegram ID
 
-# Majburiy obuna (2 kanal + 1 guruh)
-REQUIRED_CHATS = [
-    "@bypass_bypasss",
-]
+
+REQUIRED_CHATS = ["@bypass_bypasss"]
 
 DB_PATH = "kino.db"
 
