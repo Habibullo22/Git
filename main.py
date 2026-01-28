@@ -18,9 +18,7 @@ ADMINS = {5815294733}  # <-- o'zingni Telegram ID
 
 # Majburiy obuna (2 kanal + 1 guruh)
 REQUIRED_CHATS = [
-    "@your_channel_1",
-    "@your_channel_2",
-    "@your_group_or_channel",
+    "@bypass_bypasss",
 ]
 
 DB_PATH = "kino.db"
