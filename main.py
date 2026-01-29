@@ -1,110 +1,29 @@
 import asyncio
 import logging
-import os
 import re
-import subprocess
-import uuid
 import time
+from dataclasses import dataclass
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart
-from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
-
-import pyttsx3
-
+from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 
 # =======================
 # SOZLAMALAR
 # =======================
-TOKEN = "8478058553:AAGR0eMotTJy5_zM-65bHGGsm2ImcOKKfeE"  # <-- yangi token qo'y
-DB_PATH = "media.db"
+TOKEN = "8478058553:AAGR0eMotTJy5_zM-65bHGGsm2ImcOKKfeE"
+ADMINS = {5815294733}  # admin Telegram ID
 
-# Agar majburiy kanal kerak bo'lmasa bo'sh qoldir:
-REQUIRED_CHATS = []  # masalan: ["@bypass_bypasss"]
+# Bu majburiy emas! Faqat "Kinolar bo‘lim" tugmasi uchun:
+MOVIES_CHANNEL = "@kino_olami_kinolar"  # o'zing xohlagan kanalni yoz
 
+DB_PATH = "kino.db"
 
-# =======================
-# TTS engine
-# =======================
-tts_engine = pyttsx3.init()
-tts_engine.setProperty("rate", 175)
+dp = Dispatcher()
 
-def get_system_voices():
-    voices = tts_engine.getProperty("voices") or []
-    # har bir voice: id, name, languages, gender (har doim bo'lmaydi)
-    result = []
-    for v in voices:
-        name = getattr(v, "name", "") or ""
-        vid = getattr(v, "id", "") or ""
-        # gender ko'p systemlarda yo'q bo'ladi
-        gender = getattr(v, "gender", "") or ""
-        result.append({"id": vid, "name": name, "gender": gender})
-    return result
-
-SYSTEM_VOICES = get_system_voices()
-
-def guess_gender(name: str) -> str:
-    n = name.lower()
-    # juda sodda taxmin
-    female_keys = ["female", "woman", "zira", "susan", "hazel", "aria", "eva", "anna", "irina"]
-    male_keys = ["male", "man", "david", "mark", "alex", "john", "vladimir", "pavel"]
-    if any(k in n for k in female_keys):
-        return "female"
-    if any(k in n for k in male_keys):
-        return "male"
-    return "unknown"
-
-def pick_voice_id(prefer: str) -> str:
-    """
-    prefer: 'male' yoki 'female'
-    Systemda mos voice topolmasa, birinchi voice qaytadi.
-    """
-    if not SYSTEM_VOICES:
-        return ""
-
-    # 1) gender/name bo'yicha urinamiz
-    for v in SYSTEM_VOICES:
-        g = guess_gender(v["name"])
-        if prefer == "male" and g == "male":
-            return v["id"]
-        if prefer == "female" and g == "female":
-            return v["id"]
-
-    # 2) topilmasa birinchi voice
-    return SYSTEM_VOICES[0]["id"]
-
-
-def tts_to_wav(text: str, out_path: str, voice_id: str, rate: int):
-    if voice_id:
-        try:
-            tts_engine.setProperty("voice", voice_id)
-        except Exception:
-            pass
-    try:
-        tts_engine.setProperty("rate", rate)
-    except Exception:
-        pass
-
-    tts_engine.save_to_file(text, out_path)
-    tts_engine.runAndWait()
-
-
-# =======================
-# FFmpeg
-# =======================
-def ensure_tmp():
-    os.makedirs("tmp", exist_ok=True)
-
-def clean_file(path: str):
-    try:
-        os.remove(path)
-    except Exception:
-        pass
-
-def ffmpeg_extract_audio(in_path: str, out_path: str):
-    cmd = ["ffmpeg", "-y", "-i", in_path, "-vn", "-q:a", "2", out_path]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+def is_admin(uid: int) -> bool:
+    return uid in ADMINS
 
 
 # =======================
@@ -116,10 +35,12 @@ CREATE TABLE IF NOT EXISTS users (
   joined_at INTEGER
 );
 
-CREATE TABLE IF NOT EXISTS user_voice (
-  user_id INTEGER PRIMARY KEY,
-  gender TEXT NOT NULL,
-  age TEXT NOT NULL
+CREATE TABLE IF NOT EXISTS movies (
+  code TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  file_id TEXT NOT NULL,
+  added_by INTEGER,
+  added_at INTEGER
 );
 """
 
@@ -136,247 +57,243 @@ async def db_add_user(uid: int):
         )
         await db.commit()
 
-async def db_set_voice(uid: int, gender: str, age: str):
+async def db_stats():
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT COUNT(*) FROM users")
+        (u_cnt,) = await cur.fetchone()
+        cur = await db.execute("SELECT COUNT(*) FROM movies")
+        (m_cnt,) = await cur.fetchone()
+        return int(u_cnt), int(m_cnt)
+
+async def db_add_movie(code: str, title: str, file_id: str, added_by: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT OR REPLACE INTO user_voice(user_id, gender, age) VALUES(?,?,?)",
-            (uid, gender, age)
+            "INSERT OR REPLACE INTO movies(code, title, file_id, added_by, added_at) VALUES(?,?,?,?,?)",
+            (code, title, file_id, added_by, int(time.time()))
         )
         await db.commit()
 
-async def db_get_voice(uid: int):
+async def db_get_movie(code: str):
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT gender, age FROM user_voice WHERE user_id=?", (uid,))
-        row = await cur.fetchone()
-        return row  # (gender, age) or None
+        cur = await db.execute("SELECT title, file_id FROM movies WHERE code=?", (code,))
+        return await cur.fetchone()  # (title, file_id) or None
 
+async def db_delete_movie(code: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("DELETE FROM movies WHERE code=?", (code,))
+        await db.commit()
+        return cur.rowcount > 0
 
-# =======================
-# OBUNA (ixtiyoriy)
-# =======================
-async def is_subscribed(bot: Bot, user_id: int) -> bool:
-    if not REQUIRED_CHATS:
-        return True
-    for chat in REQUIRED_CHATS:
-        try:
-            m = await bot.get_chat_member(chat_id=chat, user_id=user_id)
-            if m.status in ("left", "kicked"):
-                return False
-        except Exception:
-            return False
-    return True
+async def db_all_users():
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id FROM users")
+        return await cur.fetchall()
 
 
 # =======================
 # KEYBOARDS
 # =======================
-def kb_gender():
+def kb_channel_link():
     kb = InlineKeyboardBuilder()
-    kb.button(text="👨 Erkak", callback_data="g:male")
-    kb.button(text="👩 Ayol", callback_data="g:female")
-    kb.adjust(2)
+    kb.button(text="🔗 Kanalga o‘tish", url=f"https://t.me/{MOVIES_CHANNEL.replace('@','')}")
     return kb.as_markup()
 
-def kb_age(gender: str):
-    kb = InlineKeyboardBuilder()
-    if gender == "male":
-        kb.button(text="👦 Bola", callback_data="a:male:child")
-        kb.button(text="👨 O‘rtacha", callback_data="a:male:adult")
-        kb.button(text="👴 Katta", callback_data="a:male:old")
-    else:
-        kb.button(text="👧 Qizcha", callback_data="a:female:child")
-        kb.button(text="👩 O‘rtacha", callback_data="a:female:adult")
-        kb.button(text="👵 Katta", callback_data="a:female:old")
-    kb.adjust(1, 1, 1)
-    return kb.as_markup()
-
-def kb_menu():
+def kb_user():
     kb = ReplyKeyboardBuilder()
-    kb.button(text="🎙 Ovoz tanlash")
+    kb.button(text="🎬 Kino olish")
+    kb.button(text="📢 Kinolar bo‘lim")
     kb.button(text="ℹ️ Yordam")
-    kb.adjust(2)
+    kb.adjust(2, 1)
     return kb.as_markup(resize_keyboard=True)
 
-def kb_check():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Tekshirish", callback_data="check_sub")
-    return kb.as_markup()
+def kb_admin():
+    # ADMIN PANEL HECH QACHON YO'QOLMAYDI: doim shu menyu chiqadi
+    kb = ReplyKeyboardBuilder()
+    kb.button(text="🎬 Kino olish")
+    kb.button(text="📢 Kinolar bo‘lim")
+    kb.button(text="➕ Kino qo‘shish")
+    kb.button(text="❌ Kino o‘chirish")
+    kb.button(text="📢 Broadcast")
+    kb.button(text="📊 Statistika")
+    kb.button(text="ℹ️ Yordam")
+    kb.adjust(2, 2, 2, 1)
+    return kb.as_markup(resize_keyboard=True)
 
 
 # =======================
-# TTS PROFILES (rate)
+# ADMIN FLOWS
 # =======================
-# yoshga qarab tezlikni ozgina o'zgartiramiz
-RATE_BY_AGE = {
-    "child": 195,  # tezroq
-    "adult": 175,
-    "old": 155,    # sekinroq
-}
+@dataclass
+class AddFlow:
+    step: int = 0
+    code: str = ""
+    title: str = ""
+
+ADD_FLOW: dict[int, AddFlow] = {}
+DEL_FLOW: set[int] = set()
 
 
 # =======================
-# BOT
+# HANDLERS
 # =======================
-dp = Dispatcher()
-
-
 @dp.message(CommandStart())
-async def start(message: types.Message, bot: Bot):
+async def start(message: types.Message):
     uid = message.from_user.id
     await db_add_user(uid)
 
-    if not await is_subscribed(bot, uid):
-        await message.answer(
-            "🚫 Botdan foydalanish uchun kanalga obuna bo‘ling.\n"
-            "Obuna bo‘lgach ✅ Tekshirish bosing.",
-            reply_markup=kb_check()
-        )
-        return
-
-    current = await db_get_voice(uid)
-    if not current:
-        await message.answer(
-            "🎙 Ovoz tanlaymiz.\nAvval jinsni tanla:",
-            reply_markup=kb_gender()
-        )
+    if is_admin(uid):
+        await message.answer("✅ Admin panel", reply_markup=kb_admin())
     else:
-        await message.answer(
-            "✅ Bot tayyor!\n"
-            "Matn yozsang — tanlangan ovozda audio beradi.\n"
-            "Video yuborsang — MP3 qiladi.\n\n"
-            "Ovozni o‘zgartirish: 🎙 Ovoz tanlash",
-            reply_markup=kb_menu()
-        )
+        await message.answer("✅ Xush kelibsiz", reply_markup=kb_user())
 
 
-@dp.callback_query(F.data == "check_sub")
-async def check_sub(call: types.CallbackQuery, bot: Bot):
-    uid = call.from_user.id
-    if not await is_subscribed(bot, uid):
-        await call.answer("Hali obuna emassiz ❌", show_alert=True)
-        return
-    await call.answer("✅")
-
-
-@dp.message(F.text == "🎙 Ovoz tanlash")
-async def choose_voice(message: types.Message):
-    await message.answer("Jinsni tanla:", reply_markup=kb_gender())
-
-
-@dp.callback_query(F.data.startswith("g:"))
-async def pick_gender(call: types.CallbackQuery):
-    gender = call.data.split(":", 1)[1]
-    await call.message.edit_text("Yosh kategoriyasini tanla:", reply_markup=kb_age(gender))
-    await call.answer()
-
-
-@dp.callback_query(F.data.startswith("a:"))
-async def pick_age(call: types.CallbackQuery):
-    # a:male:child
-    _, gender, age = call.data.split(":")
-    await db_set_voice(call.from_user.id, gender, age)
-    await call.message.edit_text(
-        f"✅ Tanlandi: {('Erkak' if gender=='male' else 'Ayol')} / {age}\n\n"
-        "Endi matn yoz — audio qilib beraman.\nVideo yuborsang — MP3.",
-    )
-    await call.message.answer("Menyu ✅", reply_markup=kb_menu())
-
-    # Agar systemda ovozlar kam bo'lsa ogohlantiramiz
-    if len(SYSTEM_VOICES) <= 1:
-        await call.message.answer(
-            "ℹ️ Senda system voice juda kam ekan.\n"
-            "Erkak/ayol farqi kuchli bo‘lmasligi mumkin.\n"
-            "Xohlasang keyin real ovoz (Edge TTS) qilib beraman."
-        )
-
-    await call.answer("✅")
+@dp.message(F.text == "📢 Kinolar bo‘lim")
+async def movies_channel(message: types.Message):
+    if MOVIES_CHANNEL.startswith("@"):
+        await message.answer("📢 Kinolar bo‘lim kanali:", reply_markup=kb_channel_link())
+    else:
+        await message.answer("⚠️ Kanal sozlanmagan (MOVIES_CHANNEL ni to‘g‘ri yozing).")
 
 
 @dp.message(F.text == "ℹ️ Yordam")
 async def help_msg(message: types.Message):
-    await message.answer(
-        "📌 Qanday ishlaydi:\n"
-        "1) 🎙 Ovoz tanlash: Erkak/Ayol + yosh\n"
-        "2) Matn yozsang → audio (TTS)\n"
-        "3) Video yuborsang → MP3\n\n"
-        "⚠️ TTS ovozlar systemga bog‘liq. Real ovoz kerak bo‘lsa ayt."
-    )
-
-
-# ---------------- VIDEO -> MP3 ----------------
-@dp.message(F.video)
-async def handle_video(message: types.Message, bot: Bot):
-    ensure_tmp()
-    uid = str(uuid.uuid4())
-    in_file = f"tmp/{uid}.mp4"
-    out_file = f"tmp/{uid}.mp3"
-
-    await message.answer("⏳ Videodan audio ajratilyapti...")
-
-    f = await bot.get_file(message.video.file_id)
-    await bot.download_file(f.file_path, destination=in_file)
-
-    ffmpeg_extract_audio(in_file, out_file)
-
-    if os.path.exists(out_file) and os.path.getsize(out_file) > 0:
-        await message.answer_audio(types.FSInputFile(out_file), caption="✅ MP3 tayyor")
+    if is_admin(message.from_user.id):
+        await message.answer(
+            "Admin:\n"
+            "➕ Kino qo‘shish (kod → nom → video)\n"
+            "❌ Kino o‘chirish (kod)\n"
+            "📢 Broadcast: /bc matn\n"
+            "📊 Statistika\n\n"
+            "User: kino kodini yuborsa video chiqadi."
+        )
     else:
-        await message.answer("❌ Audio ajratib bo‘lmadi. FFmpeg o‘rnatilganini tekshir.")
-
-    clean_file(in_file)
-    clean_file(out_file)
+        await message.answer("🎬 Kino olish uchun kod yuboring. Masalan: 123")
 
 
-# ---------------- TEXT -> TTS ----------------
-@dp.message(F.text)
-async def handle_text(message: types.Message):
-    # menu buyruqlarini chetlab o'tamiz
-    if message.text in {"🎙 Ovoz tanlash", "ℹ️ Yordam"}:
+@dp.message(F.text == "🎬 Kino olish")
+async def ask_code(message: types.Message):
+    await message.answer("🎬 Kino kodini yuboring.\nMasalan: 123")
+
+
+@dp.message(F.text == "📊 Statistika")
+async def stats(message: types.Message):
+    if not is_admin(message.from_user.id):
         return
-    if message.text.startswith("/"):
+    u_cnt, m_cnt = await db_stats()
+    await message.answer(f"📊 Statistika:\n👤 Userlar: {u_cnt}\n🎬 Kinolar: {m_cnt}")
+
+
+@dp.message(F.text == "📢 Broadcast")
+async def bc_hint(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("📢 Broadcast uchun: `/bc Matn` deb yuboring.", parse_mode="Markdown")
+
+
+@dp.message(F.text.regexp(r"^/bc\s+"))
+async def bc_send(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    text = message.text[4:].strip()
+
+    users = await db_all_users()
+    ok = fail = 0
+    for (uid,) in users:
+        try:
+            await message.bot.send_message(uid, text)
+            ok += 1
+        except Exception:
+            fail += 1
+    await message.answer(f"✅ Yuborildi: {ok}\n❌ Xato: {fail}")
+
+
+# -------- Admin: Add Movie
+@dp.message(F.text == "➕ Kino qo‘shish")
+async def add_start(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    ADD_FLOW[message.from_user.id] = AddFlow(step=1)
+    await message.answer("1/3) Kino kodini yuboring (masalan: 102 yoki A12)")
+
+
+# -------- Admin: Delete Movie
+@dp.message(F.text == "❌ Kino o‘chirish")
+async def del_start(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    DEL_FLOW.add(message.from_user.id)
+    await message.answer("❌ O‘chirish uchun kino kodini yuboring.")
+
+
+# -------- Universal handler (flow + user codes)
+@dp.message()
+async def universal(message: types.Message):
+    uid = message.from_user.id
+
+    # Delete flow
+    if is_admin(uid) and uid in DEL_FLOW and message.text:
+        code = message.text.strip()
+        DEL_FLOW.discard(uid)
+        ok = await db_delete_movie(code)
+        await message.answer("✅ O‘chirildi" if ok else "❌ Bunday kod topilmadi", reply_markup=kb_admin())
         return
 
-    txt = message.text.strip()
-    if not txt:
-        return
-    if len(txt) > 600:
-        await message.answer("✍️ Matn juda uzun. 600 belgigacha yubor.")
-        return
+    # Add flow
+    if is_admin(uid) and uid in ADD_FLOW:
+        flow = ADD_FLOW[uid]
 
-    # link bo'lsa xohlasang o'qib berishi mumkin, hozir o‘tib ketamiz
-    if re.search(r"https?://", txt):
-        await message.answer("🔗 Link yubording. Matn bo‘lsa o‘qib beraman, video bo‘lsa o‘zi tashla.")
-        return
+        if flow.step == 1:
+            code = (message.text or "").strip()
+            if not re.match(r"^[A-Za-z0-9_-]{1,20}$", code):
+                await message.answer("❌ Kod noto‘g‘ri. Faqat harf/son. Qayta yuboring.", reply_markup=kb_admin())
+                return
+            flow.code = code
+            flow.step = 2
+            ADD_FLOW[uid] = flow
+            await message.answer("2/3) Kino nomini yuboring.", reply_markup=kb_admin())
+            return
 
-    # user ovoz tanlaganmi?
-    pref = await db_get_voice(message.from_user.id)
-    if not pref:
-        await message.answer("Avval ovoz tanlang:", reply_markup=kb_gender())
-        return
+        if flow.step == 2:
+            title = (message.text or "").strip()
+            if len(title) < 2:
+                await message.answer("❌ Nom juda qisqa. Qayta yuboring.", reply_markup=kb_admin())
+                return
+            flow.title = title
+            flow.step = 3
+            ADD_FLOW[uid] = flow
+            await message.answer("3/3) Endi kinoni VIDEO qilib yuboring.", reply_markup=kb_admin())
+            return
 
-    gender, age = pref
-    voice_id = pick_voice_id("male" if gender == "male" else "female")
-    rate = RATE_BY_AGE.get(age, 175)
+        if flow.step == 3:
+            if not message.video:
+                await message.answer("❌ Video yuboring (Telegram video).", reply_markup=kb_admin())
+                return
+            await db_add_movie(flow.code, flow.title, message.video.file_id, uid)
+            ADD_FLOW.pop(uid, None)
+            await message.answer(
+                f"✅ Kino qo‘shildi!\n🔑 Kod: {flow.code}\n🎬 Nomi: {flow.title}",
+                reply_markup=kb_admin()
+            )
+            return
 
-    ensure_tmp()
-    uid = str(uuid.uuid4())
-    wav_path = f"tmp/{uid}.wav"
-    mp3_path = f"tmp/{uid}.mp3"
+    # User kino kod yuborsa
+    if message.text:
+        code = message.text.strip()
 
-    await message.answer("🔊 Ovoz tayyorlanyapti...")
+        # menyu tugmalarini o'tkazib yuborish
+        if code in {
+            "🎬 Kino olish", "📢 Kinolar bo‘lim", "ℹ️ Yordam",
+            "➕ Kino qo‘shish", "❌ Kino o‘chirish", "📢 Broadcast", "📊 Statistika"
+        }:
+            return
 
-    # TTS -> wav
-    tts_to_wav(txt, wav_path, voice_id=voice_id, rate=rate)
-    # wav -> mp3
-    ffmpeg_extract_audio(wav_path, mp3_path)
+        if len(code) > 25:
+            return
 
-    if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 0:
-        await message.answer_audio(types.FSInputFile(mp3_path), caption="✅ Ovoz tayyor")
-    else:
-        await message.answer("❌ TTS xato bo‘ldi. System voice muammo bo‘lishi mumkin.")
-
-    clean_file(wav_path)
-    clean_file(mp3_path)
+        movie = await db_get_movie(code)
+        if movie:
+            title, file_id = movie
+            await message.answer_video(video=file_id, caption=f"🎬 {title}\n🔑 Kod: {code}")
 
 
 async def main():
